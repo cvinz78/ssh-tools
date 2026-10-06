@@ -1,0 +1,629 @@
+#!/usr/bin/env bash
+
+# Einfaches SSH-Helper-Script für Arch Linux
+# Version 1.1
+
+# -nc / --no-color: Farben abschalten (Fallback für ältere Konsolen);
+# zusätzlich wird die Umgebungsvariable NO_COLOR respektiert.
+USE_COLOR=1
+if [[ ${1:-} == "-nc" || ${1:-} == "--no-color" || -n ${NO_COLOR:-} ]]; then
+    USE_COLOR=0
+fi
+
+# Farbschema laut DESIGN.md
+CYAN_H="\033[1;96m"      # Überschriften
+YELLOW_H="\033[1;93m"    # Normaler Text / Eingaben
+RED_H="\033[1;91m"       # Warnung / Fehler
+MAGENTA_L="\033[1;35m"   # Datei / Befehl / Pfad
+GREEN_O="\033[1;92m"     # Status / Erfolg
+RESET="\033[0m"
+
+if [[ $USE_COLOR -eq 0 ]]; then
+    CYAN_H="" YELLOW_H="" RED_H="" MAGENTA_L="" GREEN_O="" RESET=""
+fi
+
+SESSION_USER=""
+SESSION_HOST=""
+SESSION_PORT=""
+SESSION_SET=0
+SSHFS_MOUNT_POINT=""
+
+# Standard-SSH-Port, der bei Installation/Konfiguration verwendet wird
+DEFAULT_SSH_PORT=22
+
+pause() {
+    read -rp "Weiter mit Enter..." _
+}
+
+# Script sauber beenden (SSHFS-Mount lösen) - für die 0/00-Menüregel
+exit_script() {
+    umount_sshfs_if_mounted
+    echo -e "${GREEN_O}Beende Script.${RESET}"
+    exit 0
+}
+
+# Mount bei Abbruch (STRG+C) oder Exit immer lösen
+on_abort() {
+    umount_sshfs_if_mounted
+    echo
+    echo -e "${RED_H}Skript abgebrochen. SSHFS-Mount wurde gelöst (falls vorhanden).${RESET}"
+    exit 130
+}
+
+trap on_abort INT TERM
+trap umount_sshfs_if_mounted EXIT
+
+read_credentials() {
+    if [[ $SESSION_SET -eq 1 ]]; then
+        echo -e "${YELLOW_H}Aktuelle Verbindungseinstellungen:${RESET}"
+        echo -e "  ${YELLOW_H}Benutzer:${RESET} ${MAGENTA_L}$SESSION_USER${RESET}"
+        echo -e "  ${YELLOW_H}Host/IP :${RESET} ${MAGENTA_L}$SESSION_HOST${RESET}"
+        echo -e "  ${YELLOW_H}Port    :${RESET} ${MAGENTA_L}${SESSION_PORT:-$DEFAULT_SSH_PORT}${RESET}"
+        read -rp "Diese Einstellungen weiter benutzen? (j/N): " reuse
+        if [[ $reuse == "j" || $reuse == "J" ]]; then
+            return
+        fi
+    fi
+
+    read -rp "Benutzername: " SESSION_USER
+    read -rp "Host/IP: " SESSION_HOST
+    read -rp "Port (Enter für $DEFAULT_SSH_PORT): " SESSION_PORT
+    [[ -z $SESSION_PORT ]] && SESSION_PORT=$DEFAULT_SSH_PORT
+    SESSION_SET=1
+}
+
+check_program() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+detect_ssh_port() {
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        local p
+        p=$(grep -i "^Port " /etc/ssh/sshd_config | awk '{print $2}' | tail -n1)
+        if [[ -n $p ]]; then
+            echo "$p"
+            return 0
+        fi
+    fi
+    echo "22"
+}
+
+detect_dropbear_port() {
+    if [[ -f /etc/conf.d/dropbear ]]; then
+        local p
+        p=$(grep -E '^DROPBEAR_PORT=' /etc/conf.d/dropbear | sed 's/.*=//')
+        [[ -n $p ]] && { echo "$p"; return 0; }
+    fi
+    echo "22"
+}
+
+service_running() {
+    local svc="$1"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl is-active --quiet "$svc"
+        return $?
+    fi
+    return 1
+}
+
+install_packages() {
+    local pkgmgr pkgs ans
+
+    if check_program pacman; then
+        pkgmgr="arch"
+    elif check_program apt-get; then
+        pkgmgr="deb"
+    else
+        echo -e "${RED_H}Weder pacman noch apt-get gefunden - Paketverwaltung wird nicht unterstützt.${RESET}"
+        return 1
+    fi
+
+    echo -e "${CYAN_H}=== Benötigte Pakete installieren ===${RESET}"
+    echo -e "${YELLOW_H}Was brauchst du? (OpenSSH und Dropbear zusammen ist nicht vorgesehen - eines von beiden reicht)${RESET}"
+    echo -e "${YELLOW_H}1) OpenSSH (ssh/sshd)${RESET}"
+    echo -e "${YELLOW_H}2) Dropbear (dbclient/dropbear)${RESET}"
+    echo -e "${YELLOW_H}3) SSHFS (entferntes Filesystem einbinden)${RESET}"
+    echo -e "${YELLOW_H}4) OpenSSH + SSHFS${RESET}"
+    echo -e "${YELLOW_H}5) Dropbear + SSHFS${RESET}"
+    echo -e "${YELLOW_H}0) Abbrechen (Zurück)${RESET}"
+    echo -e "${YELLOW_H}00) Beenden${RESET}"
+    read -rp "Auswahl: " sel
+
+    # Arch: openssh enthält ssh+sshd; Debian/Ubuntu trennt Client und Server,
+    # dbclient steckt im Extra-Paket dropbear-bin
+    case "$sel" in
+        1)
+            if [[ $pkgmgr == "arch" ]]; then pkgs="openssh"; else pkgs="openssh-client openssh-server"; fi
+            ;;
+        2)
+            if [[ $pkgmgr == "arch" ]]; then pkgs="dropbear"; else pkgs="dropbear dropbear-bin"; fi
+            ;;
+        3)
+            pkgs="sshfs"
+            ;;
+        4)
+            if [[ $pkgmgr == "arch" ]]; then pkgs="openssh sshfs"; else pkgs="openssh-client openssh-server sshfs"; fi
+            ;;
+        5)
+            if [[ $pkgmgr == "arch" ]]; then pkgs="dropbear sshfs"; else pkgs="dropbear dropbear-bin sshfs"; fi
+            ;;
+        0)
+            echo -e "${RED_H}Installation abgebrochen.${RESET}"
+            return 0
+            ;;
+        00)
+            exit_script
+            ;;
+        *)
+            echo -e "${RED_H}Ungültige Auswahl.${RESET}"
+            return 1
+            ;;
+    esac
+
+    echo -e "${YELLOW_H}Folgende Pakete werden installiert (${MAGENTA_L}${pkgmgr}${RESET}${YELLOW_H}):${RESET}"
+    echo -e "  ${MAGENTA_L}$pkgs${RESET}"
+    read -rp "Diese Pakete jetzt installieren? (J/n): " ans
+    if [[ $ans == "n" || $ans == "N" ]]; then
+        echo -e "${RED_H}Installation abgebrochen.${RESET}"
+        return 0
+    fi
+
+    if [[ $pkgmgr == "arch" ]]; then
+        sudo pacman -S --needed $pkgs
+    else
+        sudo apt-get update
+        sudo apt-get install -y $pkgs
+    fi
+
+    # Nach der Installation direkt den SSH-Port konfigurieren und Dienste neu starten
+    case "$sel" in
+        1|4) configure_openssh_service ;;
+        2|5) configure_dropbear_service ;;
+        # 3 = nur sshfs, kein SSH-Dienst, kein Port nötig
+    esac
+}
+
+mount_sshfs() {
+    if ! check_program sshfs; then
+        echo -e "${RED_H}sshfs ist nicht installiert.${RESET}"
+        return 1
+    fi
+
+    read_credentials
+
+    read -rp "Remote-Verzeichnis (z.B. /home/$SESSION_USER): " remote_dir
+
+    SSHFS_MOUNT_POINT="$HOME/tmp"
+
+    if [[ ! -d $SSHFS_MOUNT_POINT ]]; then
+        mkdir -p "$SSHFS_MOUNT_POINT" || {
+            echo -e "${RED_H}Konnte Mountpunkt nicht erstellen.${RESET}"
+            SSHFS_MOUNT_POINT=""
+            return 1
+        }
+    fi
+
+    echo -e "${GREEN_O}Binde ein: ${MAGENTA_L}$SESSION_USER@$SESSION_HOST:$remote_dir${RESET} ${GREEN_O}-> ${MAGENTA_L}$SSHFS_MOUNT_POINT${RESET}"
+    sshfs -p "$SESSION_PORT" "$SESSION_USER@$SESSION_HOST:$remote_dir" "$SSHFS_MOUNT_POINT"
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED_H}sshfs Mount fehlgeschlagen.${RESET}"
+        SSHFS_MOUNT_POINT=""
+        return 1
+    fi
+
+    echo -e "${GREEN_O}Eingebunden auf ${MAGENTA_L}$SSHFS_MOUNT_POINT${RESET}${GREEN_O}.${RESET}"
+    echo -e "${YELLOW_H}Nutze den Ordner und drücke danach Enter, um auszuhängen.${RESET}"
+    pause
+
+    umount_sshfs_if_mounted
+    after_connection_menu
+}
+
+umount_sshfs_if_mounted() {
+    if [[ -n $SSHFS_MOUNT_POINT ]]; then
+        if command -v mountpoint >/dev/null 2>&1; then
+            if mountpoint -q "$SSHFS_MOUNT_POINT"; then
+                echo -e "${GREEN_O}Hänge SSHFS-Mount ${MAGENTA_L}$SSHFS_MOUNT_POINT${RESET} ${GREEN_O}aus...${RESET}"
+                fusermount -u "$SSHFS_MOUNT_POINT" 2>/dev/null || \
+                fusermount3 -u "$SSHFS_MOUNT_POINT" 2>/dev/null || \
+                sudo umount "$SSHFS_MOUNT_POINT"
+            fi
+        else
+            if mount | grep -q "on $SSHFS_MOUNT_POINT "; then
+                echo -e "${GREEN_O}Hänge SSHFS-Mount ${MAGENTA_L}$SSHFS_MOUNT_POINT${RESET} ${GREEN_O}aus...${RESET}"
+                fusermount -u "$SSHFS_MOUNT_POINT" 2>/dev/null || \
+                fusermount3 -u "$SSHFS_MOUNT_POINT" 2>/dev/null || \
+                sudo umount "$SSHFS_MOUNT_POINT"
+            fi
+        fi
+
+        if [[ -d $SSHFS_MOUNT_POINT ]]; then
+            rmdir "$SSHFS_MOUNT_POINT" 2>/dev/null
+        fi
+
+        SSHFS_MOUNT_POINT=""
+    fi
+}
+
+ssh_connect_openssh() {
+    if ! check_program ssh; then
+        echo -e "${RED_H}openssh (ssh) ist nicht installiert.${RESET}"
+        return 1
+    fi
+
+    read_credentials
+
+    echo -e "${GREEN_O}Starte SSH-Verbindung mit openssh...${RESET}"
+    ssh -p "$SESSION_PORT" "$SESSION_USER@$SESSION_HOST"
+
+    echo -e "${GREEN_O}Verbindung beendet.${RESET}"
+    after_connection_menu
+}
+
+ssh_connect_dropbear() {
+    if ! check_program dbclient; then
+        echo -e "${RED_H}dropbear (dbclient) ist nicht installiert.${RESET}"
+        return 1
+    fi
+
+    read_credentials
+
+    echo -e "${GREEN_O}Starte SSH-Verbindung mit dropbear (dbclient)...${RESET}"
+    dbclient -p "$SESSION_PORT" "$SESSION_USER@$SESSION_HOST"
+
+    echo -e "${GREEN_O}Verbindung beendet.${RESET}"
+    after_connection_menu
+}
+
+ssh_file_transfer() {
+    if ! check_program scp; then
+        echo -e "${RED_H}scp (Teil von openssh) ist nicht installiert.${RESET}"
+        return 1
+    fi
+
+    read_credentials
+
+    echo -e "${YELLOW_H}1) Datei/Ordner HOCHladen (lokal -> remote)${RESET}"
+    echo -e "${YELLOW_H}2) Datei/Ordner HERUNTERladen (remote -> lokal)${RESET}"
+    echo -e "${YELLOW_H}0) Zurück${RESET}"
+    echo -e "${YELLOW_H}00) Beenden${RESET}"
+    read -rp "Auswahl: " mode
+
+    case "$mode" in
+        0)
+            return 0
+            ;;
+        00)
+            exit_script
+            ;;
+        1)
+            read -rp "Lokale Datei/Ordner: " local_path
+            read -rp "Remote-Zielpfad (z.B. /home/$SESSION_USER/): " remote_path
+            scp -P "$SESSION_PORT" -r "$local_path" "$SESSION_USER@$SESSION_HOST:$remote_path"
+            ;;
+        2)
+            read -rp "Remote Datei/Ordner (z.B. /home/$SESSION_USER/datei): " remote_path
+            read -rp "Lokaler Zielpfad (z.B. /home/$(whoami)/Downloads/): " local_path
+            scp -P "$SESSION_PORT" -r "$SESSION_USER@$SESSION_HOST:$remote_path" "$local_path"
+            ;;
+        *)
+            echo -e "${RED_H}Ungültige Auswahl.${RESET}"
+            ;;
+    esac
+
+    after_connection_menu
+}
+
+# Port in eine SSH-Konfiguration eintragen: vorhandene Port-Zeile ersetzen,
+# sonst oben in der Datei einfügen (erste Zeile gewinnt in ssh/sshd_config)
+write_ssh_port_to_config() {
+    local file="$1" port="$2"
+    if [[ ! -f $file ]]; then
+        echo -e "${RED_H}WARNUNG: ${MAGENTA_L}$file${RESET} ${RED_H}nicht gefunden - Port wird dort nicht eingetragen.${RESET}"
+        return 1
+    fi
+    if grep -qi '^Port ' "$file"; then
+        sudo sed -i "s/^Port .*/Port $port/I" "$file"
+    else
+        sudo sed -i "1i Port $port" "$file"
+    fi
+}
+
+configure_dropbear_service() {
+    if ! check_program dropbear; then
+        echo -e "${RED_H}dropbear ist nicht installiert. Installiere...${RESET}"
+        if check_program pacman; then
+            sudo pacman -S --needed dropbear
+        elif check_program apt-get; then
+            sudo apt-get update
+            sudo apt-get install -y dropbear dropbear-bin
+        else
+            echo -e "${RED_H}Keine unterstützte Paketverwaltung - dropbear manuell installieren.${RESET}"
+            return 1
+        fi
+    fi
+
+    read -rp "Dropbear-Port (Enter für $DEFAULT_SSH_PORT): " dp
+    [[ -z $dp ]] && dp=$DEFAULT_SSH_PORT
+
+    # Arch: /etc/conf.d/dropbear, Debian/Ubuntu: /etc/default/dropbear
+    local db_cfg=""
+    [[ -f /etc/conf.d/dropbear ]] && db_cfg="/etc/conf.d/dropbear"
+    if [[ -z $db_cfg && -f /etc/default/dropbear ]]; then
+        db_cfg="/etc/default/dropbear"
+    fi
+
+    if [[ -n $db_cfg ]]; then
+        if grep -q '^DROPBEAR_PORT=' "$db_cfg"; then
+            sudo sed -i "s/^DROPBEAR_PORT=.*/DROPBEAR_PORT=$dp/" "$db_cfg" 2>/dev/null || true
+        else
+            echo "DROPBEAR_PORT=$dp" | sudo tee -a "$db_cfg" >/dev/null
+        fi
+    else
+        echo -e "${RED_H}WARNUNG: Keine Dropbear-Konfigurationsdatei gefunden (weder /etc/conf.d/dropbear noch /etc/default/dropbear).${RESET}"
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        sudo systemctl enable dropbear
+        sudo systemctl restart dropbear
+    fi
+
+    echo -e "${GREEN_O}Dropbear konfiguriert und gestartet (Port ${MAGENTA_L}$dp${RESET} ${GREEN_O}in ${MAGENTA_L}${db_cfg:-keine Config}${RESET} ${GREEN_O}eingetragen, falls unterstützt).${RESET}"
+}
+
+configure_openssh_service() {
+    if ! check_program sshd && [[ ! -x /usr/sbin/sshd ]]; then
+        echo -e "${RED_H}openssh (sshd) ist nicht installiert. Installiere...${RESET}"
+        if check_program pacman; then
+            sudo pacman -S --needed openssh
+        elif check_program apt-get; then
+            sudo apt-get update
+            sudo apt-get install -y openssh-client openssh-server
+        else
+            echo -e "${RED_H}Keine unterstützte Paketverwaltung - openssh manuell installieren.${RESET}"
+            return 1
+        fi
+    fi
+
+    read -rp "OpenSSH-Port (Enter für $DEFAULT_SSH_PORT): " sp
+    [[ -z $sp ]] && sp=$DEFAULT_SSH_PORT
+
+    write_ssh_port_to_config /etc/ssh/sshd_config "$sp"
+    write_ssh_port_to_config /etc/ssh/ssh_config "$sp"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        # Arch: Dienst heißt sshd, Debian/Ubuntu: ssh
+        local svc="sshd"
+        if systemctl list-unit-files --type=service 2>/dev/null | grep -q '^ssh\.service'; then
+            svc="ssh"
+        fi
+        sudo systemctl enable "$svc"
+        sudo systemctl restart "$svc"
+    fi
+
+    echo -e "${GREEN_O}OpenSSH konfiguriert und gestartet: Port ${MAGENTA_L}$sp${RESET} ${GREEN_O}in ${MAGENTA_L}/etc/ssh/ssh_config${RESET} ${GREEN_O}und ${MAGENTA_L}/etc/ssh/sshd_config${RESET} ${GREEN_O}eingetragen, Dienst neu gestartet.${RESET}"
+}
+
+select_ssh_server() {
+    echo -e "${CYAN_H}=== SSH-Server auswählen (OpenSSH vs Dropbear) ===${RESET}"
+
+    if check_program sshd; then
+        if service_running sshd; then
+            ssh_port=$(detect_ssh_port)
+            echo -e "${GREEN_O}OpenSSH (sshd) ist installiert und läuft auf Port ${MAGENTA_L}$ssh_port${RESET}${GREEN_O}.${RESET}"
+        else
+            echo -e "${RED_H}OpenSSH (sshd) ist installiert, Dienst läuft NICHT.${RESET}"
+        fi
+    else
+        echo -e "${RED_H}OpenSSH (sshd) ist NICHT installiert.${RESET}"
+    fi
+
+    if check_program dropbear; then
+        if service_running dropbear; then
+            db_port=$(detect_dropbear_port)
+            echo -e "${GREEN_O}Dropbear ist installiert und läuft auf Port ${MAGENTA_L}$db_port${RESET}${GREEN_O}.${RESET}"
+        else
+            echo -e "${RED_H}Dropbear ist installiert, Dienst läuft NICHT.${RESET}"
+        fi
+    else
+        echo -e "${RED_H}Dropbear ist NICHT installiert.${RESET}"
+    fi
+
+    echo
+    echo -e "${YELLOW_H}Was möchtest du tun?${RESET}"
+    echo -e "${YELLOW_H}1) OpenSSH (sshd) konfigurieren / starten${RESET}"
+    echo -e "${YELLOW_H}2) Dropbear konfigurieren / starten${RESET}"
+    echo -e "${YELLOW_H}3) Beide (OpenSSH + Dropbear) installieren (falls nötig)${RESET}"
+    echo -e "${YELLOW_H}0) Zurück${RESET}"
+    echo -e "${YELLOW_H}00) Beenden${RESET}"
+    read -rp "Auswahl: " sel
+
+    case "$sel" in
+        1) configure_openssh_service ;;
+        2) configure_dropbear_service ;;
+        3) install_packages ;;
+        0) ;;
+        00) exit_script ;;
+        *) echo -e "${RED_H}Ungültige Auswahl.${RESET}" ;;
+    esac
+}
+
+create_ssh_key() {
+    if ! check_program ssh-keygen; then
+        echo -e "${RED_H}ssh-keygen ist nicht verfügbar (Teil von openssh). Bitte openssh installieren.${RESET}"
+        return 1
+    fi
+
+    echo -e "${CYAN_H}=== SSH-Key erstellen/ändern ===${RESET}"
+    echo -e "${YELLOW_H}Welchen Schlüsseltyp möchtest du verwenden?${RESET}"
+    echo -e "${YELLOW_H}1) ed25519 (empfohlen)${RESET}"
+    echo -e "${YELLOW_H}2) rsa${RESET}"
+    echo -e "${YELLOW_H}3) ecdsa${RESET}"
+    echo -e "${YELLOW_H}0) Zurück${RESET}"
+    echo -e "${YELLOW_H}00) Beenden${RESET}"
+    read -rp "Auswahl (1-3, Enter für 1, 0=Zurück, 00=Beenden): " keychoice
+
+    local keytype="ed25519"
+    case "$keychoice" in
+        2) keytype="rsa" ;;
+        3) keytype="ecdsa" ;;
+        0) return 0 ;;
+        00) exit_script ;;
+        *) keytype="ed25519" ;;
+    esac
+
+    local default_path="$HOME/.ssh"
+    mkdir -p "$default_path"
+
+    local suggested="$default_path/id_$keytype"
+    read -rp "Pfad/Name für den Schlüssel (Enter für $suggested): " keypath
+    [[ -z $keypath ]] && keypath="$suggested"
+
+    if [[ -f $keypath ]]; then
+        echo -e "${RED_H}Hinweis: ${MAGENTA_L}$keypath${RESET} ${RED_H}existiert bereits.${RESET}"
+        echo -e "${YELLOW_H}1) Schlüssel komplett NEU erstellen (Datei überschreiben)${RESET}"
+        echo -e "${YELLOW_H}2) Nur Passphrase eines vorhandenen Schlüssels ändern${RESET}"
+        echo -e "${YELLOW_H}0) Abbrechen (Zurück)${RESET}"
+        echo -e "${YELLOW_H}00) Beenden${RESET}"
+        read -rp "Auswahl: " kopt
+
+        case "$kopt" in
+            1)
+                read -rp "Wirklich überschreiben? (j/N): " overwrite
+                if [[ $overwrite != "j" && $overwrite != "J" ]]; then
+                    echo -e "${RED_H}Abgebrochen, Schlüssel wurde nicht geändert.${RESET}"
+                    return 1
+                fi
+                echo -e "${GREEN_O}Erstelle neuen SSH-Key (überschreibe ${MAGENTA_L}$keypath${RESET}${GREEN_O})...${RESET}"
+                ssh-keygen -t "$keytype" -f "$keypath"
+                ;;
+            2)
+                echo -e "${GREEN_O}Ändere nur die Passphrase von ${MAGENTA_L}$keypath${RESET}${GREEN_O}...${RESET}"
+                ssh-keygen -p -f "$keypath"
+                ;;
+            00)
+                exit_script
+                ;;
+            *)
+                echo -e "${RED_H}Abgebrochen.${RESET}"
+                return 1
+                ;;
+        esac
+    else
+        echo -e "${GREEN_O}Erstelle neuen SSH-Key unter ${MAGENTA_L}$keypath${RESET}${GREEN_O}...${RESET}"
+        ssh-keygen -t "$keytype" -f "$keypath"
+    fi
+
+    echo -e "${GREEN_O}Fertig. Öffentlicher Schlüssel: ${MAGENTA_L}${keypath}.pub${RESET}"
+}
+
+copy_ssh_key_to_remote() {
+    if ! check_program ssh-copy-id; then
+        echo -e "${RED_H}ssh-copy-id ist nicht verfügbar (Teil von openssh). Bitte sicherstellen, dass openssh installiert ist.${RESET}"
+        return 1
+    fi
+
+    read_credentials
+
+    echo -e "${CYAN_H}=== SSH-Key auf Remote-System übertragen ===${RESET}"
+    echo -e "${YELLOW_H}Typische Pfade: ${MAGENTA_L}~/.ssh/id_ed25519.pub${RESET}${YELLOW_H}, ${MAGENTA_L}~/.ssh/id_rsa.pub${RESET}"
+    read -rp "Pfad zur öffentlichen Schlüsseldatei (.pub, Enter für ~/.ssh/id_ed25519.pub): " pubkey
+    [[ -z $pubkey ]] && pubkey="$HOME/.ssh/id_ed25519.pub"
+
+    if [[ ! -f $pubkey ]]; then
+        echo -e "${RED_H}Datei ${MAGENTA_L}$pubkey${RESET} ${RED_H}wurde nicht gefunden.${RESET}"
+        return 1
+    fi
+
+    echo -e "${GREEN_O}Übertrage Schlüssel zu ${MAGENTA_L}$SESSION_USER@$SESSION_HOST${RESET} ${GREEN_O}(Port ${MAGENTA_L}$SESSION_PORT${RESET}${GREEN_O})...${RESET}"
+    ssh-copy-id -i "$pubkey" -p "$SESSION_PORT" "$SESSION_USER@$SESSION_HOST"
+
+    echo -e "${YELLOW_H}Wenn keine Fehler auftraten, solltest du dich nun ohne Passwort anmelden können.${RESET}"
+}
+
+after_connection_menu() {
+    umount_sshfs_if_mounted
+    echo
+    echo -e "${YELLOW_H}Mit den gleichen Zugangsdaten eine andere Funktion verwenden?${RESET}"
+    echo -e "${YELLOW_H}1) Ja, erneut Menü anzeigen${RESET}"
+    echo -e "${YELLOW_H}2) Nein, Script beenden${RESET}"
+    echo -e "${YELLOW_H}0) Zurück zum Hauptmenü${RESET}"
+    echo -e "${YELLOW_H}00) Beenden${RESET}"
+    read -rp "Auswahl: " again
+    case "$again" in
+        1|0) main_menu ;;
+        00) exit_script ;;
+        *) echo -e "${GREEN_O}Beende Script.${RESET}" ; exit 0 ;;
+    esac
+}
+
+main_menu() {
+    while true; do
+        echo
+        echo -e "${CYAN_H}==== SSH-Helper ====${RESET}"
+        echo -e "${YELLOW_H}1) SSH verbinden (Client: OpenSSH/Dropbear)${RESET}"
+        echo -e "${YELLOW_H}2) SSH Datei Up/Download (scp)${RESET}"
+        echo -e "${YELLOW_H}3) SSHFS entferntes Filesystem einbinden (~/tmp)${RESET}"
+        echo -e "${YELLOW_H}4) Benötigte Pakete installieren (Arch/Ubuntu/Debian)${RESET}"
+        echo -e "${YELLOW_H}5) SSH-Server wählen/prüfen (OpenSSH oder Dropbear)${RESET}"
+        echo -e "${YELLOW_H}6) SSH-Key erstellen/ändern${RESET}"
+        echo -e "${YELLOW_H}7) SSH-Key auf Remote-System übertragen (Passwortlose Anmeldung)${RESET}"
+        echo -e "${YELLOW_H}0) Beenden${RESET}"
+        echo -e "${YELLOW_H}00) Beenden${RESET}"
+
+        read -rp "Auswahl: " choice
+
+        case "$choice" in
+            1)
+                echo -e "${YELLOW_H}Mit welchem Client verbinden?${RESET}"
+                echo -e "${YELLOW_H}1) OpenSSH (ssh)${RESET}"
+                echo -e "${YELLOW_H}2) Dropbear (dbclient)${RESET}"
+                echo -e "${YELLOW_H}0) Zurück${RESET}"
+                echo -e "${YELLOW_H}00) Beenden${RESET}"
+                read -rp "Auswahl: " sshchoice
+                case "$sshchoice" in
+                    1) ssh_connect_openssh ;;
+                    2) ssh_connect_dropbear ;;
+                    0) ;;
+                    00) exit_script ;;
+                    *) echo -e "${RED_H}Ungültige Auswahl.${RESET}" ;;
+                esac
+                ;;
+            2)
+                ssh_file_transfer
+                ;;
+            3)
+                mount_sshfs
+                ;;
+            4)
+                install_packages
+                ;;
+            5)
+                select_ssh_server
+                ;;
+            6)
+                create_ssh_key
+                ;;
+            7)
+                copy_ssh_key_to_remote
+                ;;
+            0|00)
+                umount_sshfs_if_mounted
+                echo -e "${GREEN_O}Beende Script.${RESET}"
+                exit 0
+                ;;
+            *)
+                echo -e "${RED_H}Ungültige Auswahl.${RESET}"
+                ;;
+        esac
+    done
+}
+
+if service_running sshd; then
+    port=$(detect_ssh_port)
+    echo -e "${GREEN_O}Lokaler sshd-Dienst läuft auf Port ${MAGENTA_L}$port${RESET}${GREEN_O}.${RESET}"
+else
+    echo -e "${RED_H}Achtung: lokaler sshd-Dienst scheint nicht zu laufen (für eingehende Verbindungen).${RESET}"
+fi
+
+main_menu
