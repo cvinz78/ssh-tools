@@ -2,6 +2,8 @@
   <img src="assets/banner.png" alt="SSH-Tools Banner" width="720">
 </p>
 
+**Sprache / Language:** [Deutsch](README.md) · [English](README.en.md)
+
 # SSH-Tools
 
 **SSH-Tools** ist ein interaktives Menü-Werkzeug, das die täglichen SSH-Aufgaben vereinfacht: Verbindungen aufbauen, Dateien übertragen, Server installieren und konfigurieren, SSH-Keys erstellen und auf Remote-Systeme verteilen.
